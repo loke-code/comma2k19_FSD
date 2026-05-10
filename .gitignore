@@ -1,0 +1,16 @@
+# Data folders
+data/
+comma_data/
+training_sample/
+comma2k19_data/
+
+# Video/Numpy files
+*.hevc
+*.zip
+*.npy
+
+# Python/Jupyter noise
+__pycache__/
+.ipynb_checkpoints/
+
+notes.txt
