@@ -1,9 +1,5 @@
 # Comma2k19 Data Loader & Visualizer
 
-A PyTorch-compatible data loading pipeline and visualization tool for the [comma2k19 dataset](https://github.com/commaai/comma2k19) — a collection of 2000km of annotated driving data recorded using a comma EON dashcam.
-
----
-
 ## Table of Contents
 - [Dataset Structure](#dataset-structure)
 - [Dependencies](#dependencies)

@@ -3,6 +3,7 @@ data/
 comma_data/
 training_sample/
 comma2k19_data/
+.vscode/
 
 # Video/Numpy files
 *.hevc
@@ -14,3 +15,4 @@ __pycache__/
 .ipynb_checkpoints/
 
 notes.txt
+settings.json
