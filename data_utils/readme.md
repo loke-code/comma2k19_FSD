@@ -191,13 +191,13 @@ A single frame cannot tell you if the car is accelerating, braking, or mid-turn.
 **History samples:**
 CAN values are sampled at t-1.5s, t-1.0s, and t-0.5s before the current frame using the same np.interp interpolation used elsewhere. For frames near the start of a segment where history would fall before the first CAN reading, np.interp clamps to the earliest available value automatically.
 ```
-  t-1.5s    t-1.0s    t-0.5s    t_current          t+1.0s
-    │          │          │          │                  │
-────●──────────●──────────●──────────●──────────────────●────
-    ↑          ↑          ↑          ↑                  ↑
-   history              history   x_speed            y_speed
-                                  x_steer            y_steer
-                                  x_frame
+  t-2s  t-1s      t-0.4s    t-0.1s    t_current          t+1.0s
+    │    │          │          │          │                  │
+────●────●──────────●──────────●──────────●──────────────────●────
+    ↑    ↑          ↑          ↑          ↑                  ↑
+history history   history    history     x_speed            y_speed
+                                         x_steer            y_steer
+                                         x_frame
 ```
 
 ### What Each Sample Contains
@@ -211,8 +211,8 @@ Each item yielded is a dictionary of tensors:
 | `x_steer` | `scalar` | `float32` | Steering angle at `t_current` (degrees) |
 | `y_speed` | `scalar` | `float32` | Vehicle speed at `t_current + future_time` (m/s) — **label** |
 | `y_steer` | `scalar` | `float32` | Steering angle at `t_current + future_time` (degrees) — **label** |
-| `x_speed_history` | `(3,)` | `float32` | Speed at `t-1.5, t-1.0, t-0.5` (m/s) |
-| `x_steer_history` | `(3,)` | `float32` | Steer at `t-1.5, t-1.0, t-0.5` (degrees) |
+| `x_speed_history` | `(3,)` | `float32` | Speed at `t-0.1, t-0.4, t-1, t-2` (m/s) |
+| `x_steer_history` | `(3,)` | `float32` | Steer at `t-0.1, t-0.4, t-1, t-2` (degrees) |
 
 When batched with `batch_size=32`, shapes become `(32, 3, 256, 256)`, `(32,)`, etc.
 

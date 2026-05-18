@@ -3,6 +3,7 @@ import cv2
 from pathlib import Path
 from torch.utils.data import IterableDataset, DataLoader
 import torch
+import random
 
 
 class Comma_Segment:
@@ -52,7 +53,6 @@ class Comma_Segment:
     def __len__(self):
         return len(self.frame_times)
 
-
 class Comma_Instance(IterableDataset):
     '''
     This class will provide a single 'Instance' to train
@@ -94,7 +94,12 @@ class Comma_Instance(IterableDataset):
     def __iter__(self):
         ''' Logic of how we iterate though each segment '''
         # loops through all segments in given dated subfolder within chunk folder
-        for seg_path in self.segment_paths:
+
+        # shuffle the order we visit segments
+        shuffled_segments = self.segment_paths.copy()
+        random.shuffle(shuffled_segments)
+
+        for seg_path in shuffled_segments:
             # segment object to process this particular segment
             segment = Comma_Segment(seg_path, self.target_size)
             # to avoid indexing or overflow errors, stop at max
@@ -102,8 +107,13 @@ class Comma_Instance(IterableDataset):
 
             frames = self._load_segment_frames(segment)  # load whole segment at once
 
+            # shuffle frames, 
+            frame_indices = list(range(len(frames)))
+            random.shuffle(frame_indices)
+
             # iterate through each frame in the video
-            for frame_idx, frame in enumerate(frames):
+            for frame_idx in frame_indices:
+                frame = frames[frame_idx]
                 # current frame recorded time (t), and predicting time (t+1)
                 t_current = segment.frame_times[frame_idx]
                 t_plus_1 = t_current + self.future_time
@@ -131,7 +141,6 @@ class Comma_Instance(IterableDataset):
             
             del frames  # free memory
 
-
 class Comma_CAN_Temporal(Comma_Instance):
     '''
     Extends Comma_Instance to include CAN history.
@@ -139,16 +148,26 @@ class Comma_CAN_Temporal(Comma_Instance):
     '''
     def __init__(self, chunk_path: Path, target_size=(256, 256), future_time=1.0):
         super().__init__(chunk_path, target_size, future_time)
-        self.history_offsets = [1.5, 1.0, 0.5]  # seconds in past, ordered oldest → newest
+        self.history_offsets = [0.1, 0.4, 1.0, 2.0]  # seconds in past, ordered newest → oldest
 
     def __iter__(self):
-        for seg_path in self.segment_paths:
+        # shuffle the order we visit segments
+        shuffled_segments = self.segment_paths.copy()
+        random.shuffle(shuffled_segments)
+
+        for seg_path in shuffled_segments:
             segment = Comma_Segment(seg_path, self.target_size)
             max_can_time = min(segment.speed_t[-1], segment.steer_t[-1])
 
             frames = self._load_segment_frames(segment)
 
-            for frame_idx, frame in enumerate(frames):
+            # shuffle the frames ordering aswell using indices
+            frame_indices = list(range(len(frames)))
+            random.shuffle(frame_indices)
+
+            for frame_idx in frame_indices:
+
+                frame = frames[frame_idx]
                 t_current = segment.frame_times[frame_idx]
                 t_future  = t_current + self.future_time
 
@@ -160,7 +179,7 @@ class Comma_CAN_Temporal(Comma_Instance):
                 x_speed, x_steer = segment.get_CAN_data(t_current)
                 y_speed, y_steer = segment.get_CAN_data(t_future)
 
-                # history: sample CAN at t-1.5, t-1.0, t-0.5
+                # history: sample CAN at t-0.1, t-0.4, t-1, t-2
                 # np.interp clamps to boundary if t_past < first CAN timestamp, so early frames are safe
                 speed_history = [segment.get_CAN_data(t_current - offset)[0] for offset in self.history_offsets]
                 steer_history = [segment.get_CAN_data(t_current - offset)[1] for offset in self.history_offsets]
@@ -169,8 +188,8 @@ class Comma_CAN_Temporal(Comma_Instance):
                     "x_frame":         torch.from_numpy(frame).permute(2, 0, 1).float() / 255.0,
                     "x_speed":         torch.tensor(x_speed,       dtype=torch.float32),
                     "x_steer":         torch.tensor(x_steer,       dtype=torch.float32),
-                    "x_speed_history": torch.tensor(speed_history, dtype=torch.float32),  # (3,)
-                    "x_steer_history": torch.tensor(steer_history, dtype=torch.float32),  # (3,)
+                    "x_speed_history": torch.tensor(speed_history, dtype=torch.float32),  # (4,)
+                    "x_steer_history": torch.tensor(steer_history, dtype=torch.float32),  # (4,)
                     "y_speed":         torch.tensor(y_speed,       dtype=torch.float32),
                     "y_steer":         torch.tensor(y_steer,       dtype=torch.float32),
                 }
