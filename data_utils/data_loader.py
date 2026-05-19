@@ -197,8 +197,165 @@ class Comma_CAN_Temporal(Comma_Instance):
             del frames
 
 
+class LeRobotTrajectory:
+    """
+    Represents one full trajectory (segment) in LeRobot format.
+    """
+
+    def __init__(self, segment: Comma_Segment, frames, future_time=1.0):
+        self.segment = segment
+        self.frames = frames
+        self.future_time = future_time
+
+        self.frame_times = segment.frame_times
+        self.max_can_time = min(segment.speed_t[-1], segment.steer_t[-1])
+
+        # precompute valid indices (temporal consistency preserved)
+        self.valid_indices = [
+            i for i in range(len(frames))
+            if self.frame_times[i] + future_time <= self.max_can_time
+        ]
+
+    def __len__(self):
+        return len(self.valid_indices)
+
+    def get_step(self, idx):
+        """
+        Returns one LeRobot-style timestep:
+        observation + action
+        """
+        frame_idx = self.valid_indices[idx]
+
+        t = self.frame_times[frame_idx]
+        t_future = t + self.future_time
+
+        frame = self.frames[frame_idx]
+
+        x_speed, x_steer = self.segment.get_CAN_data(t)
+        y_speed, y_steer = self.segment.get_CAN_data(t_future)
+
+        obs = {
+            "image": torch.from_numpy(frame).permute(2, 0, 1).float() / 255.0, # OpenCV is BGR, not RGB
+            "state": torch.tensor([x_speed, x_steer], dtype=torch.float32),
+        }
+
+        action = torch.tensor([y_speed, y_steer], dtype=torch.float32)
+
+        return obs, action
+
+class CommaLeRobotTrajectories(IterableDataset):
+    """
+    Returns full trajectories (episodes), not single frames.
+    """
+
+    def __init__(self, chunk_path, target_size=(256, 256), future_time=1.0):
+        self.base = Comma_Instance(chunk_path, target_size, future_time)
+        self.target_size = target_size
+        self.future_time = future_time
+        self.segment_paths = self.base.segment_paths
+
+    def __iter__(self):
+        segments = self.segment_paths.copy()
+        random.shuffle(segments)
+
+        for seg_path in segments:
+            segment = Comma_Segment(seg_path, self.target_size)
+            frames = self.base._load_segment_frames(segment)
+
+            traj = LeRobotTrajectory(
+                segment=segment,
+                frames=frames,
+                future_time=self.future_time
+            )
+
+            observations = []
+            actions = []
+
+            for i in range(len(traj)):
+                obs, act = traj.get_step(i)
+                observations.append(obs)
+                actions.append(act)
+
+            yield {
+                "observations": observations,
+                "actions": torch.stack(actions),
+                "length": len(traj),
+            }
+
+
+
+    class CommaLeRobotDataset(IterableDataset):
+        """
+        Single PyTorch + LeRobot-compatible dataset.
+    
+        Uses:
+            Comma_Segment
+            LeRobotTrajectory
+    
+        Returns:
+            observations: (T, 3, H, W), (T, 2)
+            actions: (T, 2)
+        """
+    
+        def __init__(self, chunk_path, target_size=(256, 256), future_time=1.0):
+            self.base = Comma_Instance(chunk_path, target_size, future_time)
+            self.segment_paths = self.base.segment_paths
+            self.target_size = target_size
+            self.future_time = future_time
+    
+        def __iter__(self):
+            segments = self.segment_paths.copy()
+            random.shuffle(segments)
+    
+            for seg_path in segments:
+    
+                # -----------------------------
+                # 1. build segment
+                # -----------------------------
+                segment = Comma_Segment(seg_path, self.target_size)
+    
+                # -----------------------------
+                # 2. load frames
+                # -----------------------------
+                frames = self.base._load_segment_frames(segment)
+    
+                # -----------------------------
+                # 3. use YOUR existing trajectory class
+                # -----------------------------
+                traj = LeRobotTrajectory(
+                    segment=segment,
+                    frames=frames,
+                    future_time=self.future_time
+                )
+    
+                # -----------------------------
+                # 4. build tensors using trajectory
+                # -----------------------------
+                images = []
+                states = []
+                actions = []
+    
+                for i in range(len(traj)):
+                    obs, act = traj.get_step(i)
+    
+                    images.append(obs["image"])
+                    states.append(obs["state"])
+                    actions.append(act)
+    
+                # -----------------------------
+                # 5. return LeRobot-style sample
+                # -----------------------------
+                yield {
+                    "observations": {
+                        "image": torch.stack(images),   # (T, 3, H, W)
+                        "state": torch.stack(states)    # (T, 2)
+                    },
+                    "actions": torch.stack(actions),   # (T, 2)
+                    "length": len(traj)
+                }
+
 if __name__ == "__main__":
-    chunk = Path("comma2k19_data\extracted\Chunk_1")
+    chunk = Path("comma2k19_data/extracted/Chunk_1")
     dataset = Comma_Instance(chunk, target_size=(256, 256), future_time=1.0)
     loader = DataLoader(dataset, batch_size=32, num_workers=0)
 

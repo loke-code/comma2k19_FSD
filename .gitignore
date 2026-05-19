@@ -14,6 +14,11 @@ openpilot/
 *.avi
 *.mp4
 
+
+# Junk files
+# NFS temp files
+.nfs*
+
 # Python/Jupyter noise
 __pycache__/
 .ipynb_checkpoints/
