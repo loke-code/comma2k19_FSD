@@ -4,11 +4,15 @@ comma_data/
 training_sample/
 comma2k19_data/
 .vscode/
+openpilot/
+
 
 # Video/Numpy files
 *.hevc
 *.zip
 *.npy
+*.avi
+*.mp4
 
 # Python/Jupyter noise
 __pycache__/
