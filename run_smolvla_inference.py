@@ -23,8 +23,14 @@ from pathlib import Path
 from typing import Any
 
 import torch
+from huggingface_hub import snapshot_download
 
 from data_utils.data_loader import Comma_CAN_Temporal, Comma_Instance
+
+DEFAULT_TASK_PROMPT = (
+    "Given the current driving scene and vehicle state, predict the next driving action."
+)
+DEFAULT_HISTORY_OFFSETS = [0.1, 0.4, 1.0, 2.0]
 
 try:
     from lerobot.policies import make_pre_post_processors
@@ -81,7 +87,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--task",
-        default="Predict a driving action from the current scene.",
+        default=DEFAULT_TASK_PROMPT,
         help="Language instruction passed to the policy preprocessor",
     )
     parser.add_argument(
@@ -93,6 +99,17 @@ def parse_args() -> argparse.Namespace:
         "--use-temporal-state",
         action="store_true",
         help="Use Comma_CAN_Temporal and build a richer state vector from CAN history",
+    )
+    parser.add_argument(
+        "--history-offsets",
+        type=float,
+        nargs="+",
+        default=None,
+        help=(
+            "Optional past-time offsets in seconds for CAN history, for example "
+            "--history-offsets 0.1 0.4 1.0 2.0. If omitted, temporal mode uses "
+            f"{DEFAULT_HISTORY_OFFSETS}."
+        ),
     )
     parser.add_argument(
         "--output-jsonl",
@@ -139,6 +156,99 @@ def split_feature_keys(input_features: dict[str, Any]) -> tuple[list[str], str |
     return visual_keys, state_key
 
 
+def validate_visual_feature_shapes(
+    input_features: dict[str, Any],
+    visual_keys: list[str],
+    target_size: tuple[int, int],
+) -> tuple[int, int, int]:
+    visual_shapes = [get_feature_shape(input_features[key]) for key in visual_keys]
+    if not visual_shapes:
+        raise RuntimeError("No visual feature shapes found in the policy config.")
+
+    first_shape = visual_shapes[0]
+    if len(first_shape) != 3:
+        raise RuntimeError(f"Expected visual features with shape (C, H, W), got {first_shape}.")
+
+    for key, shape in zip(visual_keys, visual_shapes):
+        if shape != first_shape:
+            raise RuntimeError(
+                f"Visual feature shapes must match across cameras. "
+                f"Got {key}={shape} and first shape={first_shape}."
+            )
+
+    channels, expected_height, expected_width = first_shape
+    requested_width, requested_height = target_size
+    if channels != 3:
+        raise RuntimeError(f"Expected 3-channel visual inputs, got {channels}.")
+    if (requested_height, requested_width) != (expected_height, expected_width):
+        raise ValueError(
+            "Requested loader image size does not match the checkpoint. "
+            f"Loader target_size=(width={requested_width}, height={requested_height}), "
+            f"but policy expects (C={channels}, H={expected_height}, W={expected_width})."
+        )
+    return channels, expected_height, expected_width
+
+
+def validate_policy_observation(
+    observation: dict[str, Any],
+    visual_keys: list[str],
+    state_key: str | None,
+    state_dim: int,
+    expected_visual_shape: tuple[int, int, int],
+) -> None:
+    for key in visual_keys:
+        if key not in observation:
+            raise KeyError(f"Missing required visual key '{key}' in policy observation.")
+        value = observation[key]
+        if not isinstance(value, torch.Tensor):
+            raise TypeError(f"Visual key '{key}' must be a torch.Tensor, got {type(value).__name__}.")
+        if tuple(value.shape) != expected_visual_shape:
+            raise ValueError(
+                f"Visual key '{key}' has shape {tuple(value.shape)}, "
+                f"expected {expected_visual_shape}."
+            )
+
+    if state_key is not None:
+        if state_key not in observation:
+            raise KeyError(f"Missing required state key '{state_key}' in policy observation.")
+        state_value = observation[state_key]
+        if not isinstance(state_value, torch.Tensor):
+            raise TypeError(
+                f"State key '{state_key}' must be a torch.Tensor, got {type(state_value).__name__}."
+            )
+        if tuple(state_value.shape) != (state_dim,):
+            raise ValueError(
+                f"State key '{state_key}' has shape {tuple(state_value.shape)}, "
+                f"expected {(state_dim,)}."
+            )
+
+
+def ensure_model_available(model_id: str) -> str:
+    model_path = Path(model_id)
+    if model_path.exists():
+        return str(model_path)
+
+    print(f"Checking local cache for model: {model_id}")
+    try:
+        local_model_path = snapshot_download(
+            repo_id=model_id,
+            repo_type="model",
+            local_files_only=True,
+        )
+        print(f"Using cached model at: {local_model_path}")
+        return local_model_path
+    except Exception:
+        pass
+
+    print(f"Model not found in local cache. Downloading: {model_id}")
+    local_model_path = snapshot_download(
+        repo_id=model_id,
+        repo_type="model",
+    )
+    print(f"Downloaded model to: {local_model_path}")
+    return local_model_path
+
+
 def tensor_to_list(value: Any) -> Any:
     if isinstance(value, torch.Tensor):
         return value.detach().cpu().tolist()
@@ -150,10 +260,11 @@ def main() -> None:
     device = resolve_device(args.device)
 
     target_size = (args.width, args.height)
-    policy = SmolVLAPolicy.from_pretrained(args.model_id).to(device).eval()
+    model_source = ensure_model_available(args.model_id)
+    policy = SmolVLAPolicy.from_pretrained(model_source).to(device).eval()
     preprocess, postprocess = make_pre_post_processors(
         policy.config,
-        args.model_id,
+        model_source,
         preprocessor_overrides={"device_processor": {"device": str(device)}},
     )
 
@@ -165,12 +276,26 @@ def main() -> None:
 
     if not visual_keys:
         raise RuntimeError("Could not find any visual input features in the SmolVLA config.")
+    expected_visual_shape = validate_visual_feature_shapes(
+        input_features=input_features,
+        visual_keys=visual_keys,
+        target_size=target_size,
+    )
+
+    history_offsets: list[float]
+    if args.history_offsets is not None:
+        history_offsets = args.history_offsets
+    elif args.use_temporal_state:
+        history_offsets = DEFAULT_HISTORY_OFFSETS
+    else:
+        history_offsets = []
 
     dataset_cls = Comma_CAN_Temporal if args.use_temporal_state else Comma_Instance
     dataset = dataset_cls(
         args.chunk_path,
         target_size=target_size,
         future_time=args.future_time,
+        history_offsets=history_offsets,
         policy_visual_keys=visual_keys,
         policy_state_key=state_key,
         policy_state_dim=state_dim if state_key is not None else None,
@@ -179,11 +304,14 @@ def main() -> None:
     )
 
     print(f"Loaded policy: {args.model_id}")
+    print(f"Model source: {model_source}")
     print(f"Device: {device}")
     print(f"Expected visual keys: {visual_keys}")
+    print(f"Expected visual shape: {expected_visual_shape}")
     if state_key is not None:
         print(f"Expected state key: {state_key} with dim={state_dim}")
     print(f"Using dataset: {dataset_cls.__name__}")
+    print(f"History offsets: {history_offsets}")
     print()
 
     results: list[dict[str, Any]] = []
@@ -193,6 +321,13 @@ def main() -> None:
             break
 
         frame = sample["policy_observation"]
+        validate_policy_observation(
+            observation=frame,
+            visual_keys=visual_keys,
+            state_key=state_key,
+            state_dim=state_dim,
+            expected_visual_shape=expected_visual_shape,
+        )
         processed = preprocess(frame)
 
         with torch.inference_mode():
