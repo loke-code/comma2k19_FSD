@@ -50,8 +50,8 @@ def parse_args() -> argparse.Namespace:
                    help="Cap frames per episode for smoke tests")
     p.add_argument("--task", default=DEFAULT_TASK,
                    help="Task string stored with every frame")
-    p.add_argument("--use-videos", action=argparse.BooleanOptionalAction, default=True,
-                   help="Store images as video (default: True)")
+    p.add_argument("--use-videos", action=argparse.BooleanOptionalAction, default=False,
+                   help="Store images as video (default: False)")
     p.add_argument("--streaming-encoding", action="store_true",
                    help="Use LeRobot streaming video encoding")
     p.add_argument("--batch-encoding-size", type=int, default=1)

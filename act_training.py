@@ -261,36 +261,35 @@ def load_lerobot_dataset(args: argparse.Namespace):
 
 def split_dataset(dataset, val_fraction: float, seed: int):
     """
-    Episode-level train/val split so that no episode straddles the boundary.
-    Returns (train_dataset, val_dataset) as Subset objects.
+    Episode-level train/val split using episode_index column.
+    Compatible with current LeRobotDataset versions.
     """
     import random
+    import numpy as np
     from torch.utils.data import Subset
 
     random.seed(seed)
 
-    num_episodes = dataset.num_episodes
-    episode_ids  = list(range(num_episodes))
-    random.shuffle(episode_ids)
+    episode_ids = dataset["episode_index"]
+    episode_ids = np.asarray(episode_ids)
 
-    n_val = max(1, int(num_episodes * val_fraction))
-    val_episode_ids  = set(episode_ids[:n_val])
-    train_episode_ids = set(episode_ids[n_val:])
+    unique_episodes = np.unique(episode_ids)
+    unique_episodes = list(unique_episodes)
 
-    # Map episode ids to flat frame indices using episode_data_index
-    # LeRobotDataset stores per-episode start/end under episode_data_index
-    train_indices: list[int] = []
-    val_indices:   list[int] = []
+    random.shuffle(unique_episodes)
 
-    ep_index = dataset.episode_data_index  # dict with "from" and "to" tensors
-    for ep_id in range(num_episodes):
-        start = int(ep_index["from"][ep_id])
-        end   = int(ep_index["to"][ep_id])
-        indices = list(range(start, end))
+    n_val = max(1, int(len(unique_episodes) * val_fraction))
+    val_episode_ids = set(unique_episodes[:n_val])
+    train_episode_ids = set(unique_episodes[n_val:])
+
+    train_indices = []
+    val_indices = []
+
+    for i, ep_id in enumerate(episode_ids):
         if ep_id in val_episode_ids:
-            val_indices.extend(indices)
+            val_indices.append(i)
         else:
-            train_indices.extend(indices)
+            train_indices.append(i)
 
     print(f"\nTrain/val split (seed={seed}, val_fraction={val_fraction}):")
     print(f"  Train episodes: {len(train_episode_ids)}  frames: {len(train_indices)}")
@@ -301,7 +300,6 @@ def split_dataset(dataset, val_fraction: float, seed: int):
         Subset(dataset, val_indices),
         sorted(val_episode_ids),
     )
-
 
 def make_dataloaders(train_set, val_set, args: argparse.Namespace):
     from torch.utils.data import DataLoader
