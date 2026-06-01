@@ -29,11 +29,10 @@ python act_training.py --max-episodes 2 --max-frames 64 --steps 200
 from __future__ import annotations
 
 import argparse
-from ast import List
 import subprocess
 import sys
 from pathlib import Path
-import numpy as np
+import json
 
 # ---------------------------------------------------------------------------
 # CLI
@@ -84,6 +83,8 @@ def parse_args() -> argparse.Namespace:
                    help="Prediction horizon; must be >= action_horizon (default: 16)")
 
     # --- training ---
+    p.add_argument("--train-split", type = float, default=0.8, help="Train split ratio")
+    p.add_argument("--test-split", type = float, default=0.2, help="Test split ratio")
     p.add_argument("--device", default="cuda",
                    help="Training device: cuda | mps | cpu (default: cuda)")
     p.add_argument("--batch-size", type=int, default=8)
@@ -198,129 +199,27 @@ def stage_convert(args: argparse.Namespace) -> None:
 # Stage 3 — load LeRobotDataset with observation + action windowing
 # ---------------------------------------------------------------------------
 
-def import_lerobot_dataset_cls():
+def load_lerobot_dataset(args: argparse.Namespace):
+    """
+    Load the converted LeRobotDataset.
+
+    Windowing is applied via delta_timestamps:
+    - observation.images.front and observation.state: obs_horizon past frames
+      at 1/fps spacing, ending at the current frame (index 0).
+    - action: pred_horizon future steps at 1/fps spacing starting at t+1.
+
+    This produces tensors of shape:
+      observation.images.front : (obs_horizon, H, W, 3)
+      observation.state        : (obs_horizon, 2)
+      action                   : (pred_horizon, 2)
+
+    ACT training then uses action[:action_horizon] as the chunk target.
+    """
     try:
         from lerobot.datasets.lerobot_dataset import LeRobotDataset
     except ImportError:
         from lerobot.common.datasets.lerobot_dataset import LeRobotDataset
-    return LeRobotDataset
 
-
-def make_delta_timestamps(fps: int, obs_horizon: int, pred_horizon: int) -> dict:
-    """
-    Build the delta_timestamps dict that tells LeRobotDataset how to window
-    each sample.
-
-    obs_horizon  past frames (including current) for image and state:
-      e.g. obs_horizon=1, fps=20 → offsets=[0.0]   (current frame only)
-      e.g. obs_horizon=3, fps=20 → offsets=[-0.1, -0.05, 0.0]
-
-    pred_horizon future frames for action:
-      e.g. pred_horizon=16, fps=20 → offsets=[0.05, 0.1, ..., 0.8]
-
-    Resulting tensor shapes per sample:
-      observation.images.front : (obs_horizon, H, W, 3)
-      observation.state        : (obs_horizon, 2)
-      action                   : (pred_horizon, 2)
-    """
-    dt = 1.0 / fps
-    obs_offsets    = [round(-dt * (obs_horizon - 1 - k), 6) for k in range(obs_horizon)]
-    action_offsets = [round(dt * (k + 1), 6) for k in range(pred_horizon)]
-    return {
-        "observation.images.front": obs_offsets,
-        "observation.state":        obs_offsets,
-        "action":                   action_offsets,
-    }
-
-
-def load_single_split(
-    repo_id: str,
-    dataset_root: Path,
-    delta_timestamps: dict,
-    episodes: List,
-):
-    """
-    Load one LeRobotDataset for a given split string.
-
-    split follows HuggingFace convention, e.g.:
-      "train[:90%]"  — first 90% of episodes
-      "train[90%:]"  — last  10% of episodes
-
-    root must be the PARENT directory of repo_id so LeRobot can find
-    meta/info.json locally without hitting the Hub.
-    e.g.  repo_id="local/comma2k19_act", root="./lerobot_datasets"
-      → looks for ./lerobot_datasets/local/comma2k19_act/meta/info.json
-    """
-    LeRobotDataset = import_lerobot_dataset_cls()
-    return LeRobotDataset(
-        repo_id=repo_id,
-        root=str(dataset_root / repo_id),
-        delta_timestamps=delta_timestamps,
-        episodes=episodes,
-        video_backend=None
-    )
-
-
-def split_dataset(
-    repo_id: str,
-    dataset_root,
-    delta_timestamps: dict,
-    val_fraction: float,
-):
-    """
-    Create train/val datasets by splitting episode IDs.
-    """
-
-    # Load once to discover episode count
-    full_dataset = load_single_split(
-        repo_id,
-        dataset_root,
-        delta_timestamps,
-        episodes=None,
-    )
-
-    num_episodes = full_dataset.num_episodes
-
-    episode_ids = np.arange(num_episodes)
-
-    # reproducible shuffle
-    rng = np.random.default_rng(42)
-    rng.shuffle(episode_ids)
-
-    num_val = max(1, int(num_episodes * val_fraction))
-
-    val_episodes = episode_ids[:num_val].tolist()
-    train_episodes = episode_ids[num_val:].tolist()
-
-    train_dataset = load_single_split(
-        repo_id,
-        dataset_root,
-        delta_timestamps,
-        episodes=train_episodes,
-    )
-
-    val_dataset = load_single_split(
-        repo_id,
-        dataset_root,
-        delta_timestamps,
-        episodes=val_episodes,
-    )
-
-    print(
-        f"  Train — episodes: {train_dataset.num_episodes}  frames: {len(train_dataset)}"
-    )
-    print(
-        f"  Val   — episodes: {val_dataset.num_episodes}  frames: {len(val_dataset)}"
-    )
-
-    return train_dataset, val_dataset
-
-def load_lerobot_dataset(args: argparse.Namespace):
-    """
-    Orchestrates dataset loading for the training pipeline.
-    Validates the dataset path, builds delta_timestamps, then delegates
-    to split_dataset for the actual LeRobotDataset construction.
-    """
     dataset_path = args.dataset_root / args.repo_id
     if not dataset_path.exists():
         raise FileNotFoundError(
@@ -328,74 +227,215 @@ def load_lerobot_dataset(args: argparse.Namespace):
             "Run without --skip-convert first."
         )
 
-    delta_timestamps = make_delta_timestamps(args.fps, args.obs_horizon, args.pred_horizon)
+    dt = 1.0 / args.fps  # seconds per frame
 
-    print("\nDataset windowing:")
-    print(f"  obs_horizon   : {args.obs_horizon}")
-    print(f"  pred_horizon  : {args.pred_horizon}")
-    print(f"  action_horizon: {args.action_horizon}")
-    print(f"  delta_timestamps: {delta_timestamps}")
+    # Observation window: obs_horizon frames ending at t=0
+    obs_offsets = [round(-dt * (args.obs_horizon - 1 - k), 6)
+                   for k in range(args.obs_horizon)]
 
-    return split_dataset(
-        repo_id=args.repo_id,
-        dataset_root=args.dataset_root,
+    # Action / prediction window: pred_horizon steps starting at t+dt
+    action_offsets = [round(dt * (k + 1), 6) for k in range(args.pred_horizon)]
+
+    delta_timestamps = {
+        "observation.images.front": obs_offsets,
+        "observation.state":        obs_offsets,
+        "action":                   action_offsets,
+    }
+
+    print("\nLoading LeRobotDataset with windowing:")
+    print(f"  obs_horizon   : {args.obs_horizon}  offsets: {obs_offsets}")
+    print(f"  pred_horizon  : {args.pred_horizon}  offsets: {action_offsets}")
+    print(f"  action_horizon: {args.action_horizon}  (first {args.action_horizon} of pred window used)")
+
+    dataset = LeRobotDataset(
+        args.repo_id,
+        root=dataset_path,
         delta_timestamps=delta_timestamps,
-        val_fraction=args.val_fraction,
+
     )
 
+    print(f"  Total frames  : {len(dataset)}")
+    print(f"  Episodes      : {dataset.num_episodes}")
+    return dataset
+
 
 # ---------------------------------------------------------------------------
-# Stage 4 — train via lerobot-train CLI
+# Stage 4 — train / val split
 # ---------------------------------------------------------------------------
 
-def stage_train(args: argparse.Namespace) -> None:
+def split_dataset(args: argparse.Namespace):
     """
-    Delegate training entirely to LeRobot's own lerobot-train CLI.
-
-    lerobot-train handles:
-      - ACTConfig / ACTPolicy construction from the dataset's feature schema
-      - DataLoader creation (batch size, workers, sampler)
-      - AdamW optimiser + cosine LR schedule
-      - Grad clipping, EMA, WandB/tensorboard logging
-      - Checkpoint saving (every --save_freq steps + final)
-      - Resuming from the last checkpoint automatically
-
-    We only pass the knobs that differ from LeRobot defaults:
-      policy=act                     use ACT architecture
-      dataset_repo_id / dataset_root point at the local converted dataset
-      training.num_workers           forwarded from --num-workers
-      training.batch_size            forwarded from --batch-size
-      training.num_train_steps       forwarded from --steps
-      training.save_freq             forwarded from --save-every
-      training.log_freq              forwarded from --log-every
-      training.eval_freq             same as log_every
-      device                         forwarded from --device
-      output_dir                     forwarded from --output-dir
-      train_split / val_split        derived from --val-fraction
+    Wrapper around:
+    lerobot-edit-dataset --operation.type split --operation.splits ...
     """
-    val_pct   = int(args.val_fraction * 100)
-    train_pct = 100 - val_pct
+
+    splits = {
+        "train": args.train_split,
+        "test": args.test_split
+    }
 
     cmd = [
-    "lerobot-train",
-    "--policy.type", "act",
-    "--policy.push_to_hub","False", 
-    "--dataset.repo_id", args.repo_id,
-    "--dataset.root", str(args.dataset_root / args.repo_id),
-    "--batch_size", str(args.batch_size),
-    "--num_workers", str(args.num_workers),
-    "--steps", str(args.steps),
-    "--save_freq", str(args.save_every),
-    "--log_freq", str(args.log_every),
-    "--eval_freq", str(args.log_every),
-    "--output_dir", str(args.output_dir),
-    "--dataset.video_backend", args.video_backend
-
+        "lerobot-edit-dataset",
+        "--repo_id", args.repo_id,
+        "--root", args.dataset_root / args.repo_id,
+        "--operation.type", "split",
+        "--operation.splits", json.dumps(splits)
     ]
 
-    print("\nLaunching LeRobot training:")
-    print("  " + " ".join(cmd))
+    # result = subprocess.run(cmd, check=False, capture_output=True, text=True)
+
+    # print("\nSTDOUT:\n", result.stdout)
+    # print("\nSTDERR:\n", result.stderr)
+
+    # if result.returncode != 0:
+    #     raise RuntimeError("lerobot-edit-dataset failed (see stderr above)")
     subprocess.run(cmd, check=True)
+
+
+def make_dataloaders(train_set, val_set, args: argparse.Namespace):
+    from torch.utils.data import DataLoader
+
+    train_loader = DataLoader(
+        train_set,
+        batch_size=args.batch_size,
+        shuffle=True,
+        num_workers=args.num_workers,
+        pin_memory=True,
+        drop_last=True,
+    )
+    val_loader = DataLoader(
+        val_set,
+        batch_size=args.batch_size,
+        shuffle=False,
+        num_workers=args.num_workers,
+        pin_memory=True,
+        drop_last=False,
+    )
+    return train_loader, val_loader
+
+
+# ---------------------------------------------------------------------------
+# Stage 5 — ACT training loop
+# ---------------------------------------------------------------------------
+
+def make_act_policy(dataset, args: argparse.Namespace):
+    """
+    Instantiate ACT policy from LeRobot, inferring obs/action dims from the
+    dataset features.
+
+    observation.state shape : (obs_horizon, 2)   → state_dim = obs_horizon * 2
+    action shape             : (pred_horizon, 2)  → action_dim = 2, chunk = action_horizon
+    """
+    import torch
+
+    try:
+        from lerobot.policies.act.configuration_act import ACTConfig
+        from lerobot.policies.act.modeling_act import ACTPolicy
+    except ImportError as exc:
+        raise SystemExit(
+            "Could not import ACTPolicy. Make sure lerobot is installed: pip install lerobot"
+        ) from exc
+
+    # Build config aligned with the windowed dataset schema
+    cfg = ACTConfig(
+        input_shapes={
+            "observation.images.front": [args.obs_horizon, args.height, args.width, 3],
+            "observation.state":        [args.obs_horizon, 2],
+        },
+        output_shapes={
+            "action": [args.action_horizon, 2],
+        },
+        chunk_size=args.action_horizon,
+        n_action_steps=args.action_horizon,
+    )
+
+    device = torch.device(args.device if torch.cuda.is_available() or args.device != "cuda"
+                          else "cpu")
+    policy = ACTPolicy(cfg, dataset_stats=dataset.stats)
+    policy.to(device)
+
+    print(f"\nACT policy on {device}")
+    total_params = sum(p.numel() for p in policy.parameters())
+    print(f"  Parameters: {total_params:,}")
+
+    return policy, device
+
+
+def train(policy, train_loader, val_loader, args: argparse.Namespace, device) -> None:
+    import torch
+
+    optimizer = torch.optim.AdamW(policy.parameters(), lr=1e-4, weight_decay=1e-4)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.steps)
+
+    output_dir = args.output_dir
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    train_iter = iter(train_loader)
+    policy.train()
+
+    print(f"\nTraining for {args.steps} steps ...")
+
+    for step in range(1, args.steps + 1):
+        # Refill iterator when exhausted
+        try:
+            batch = next(train_iter)
+        except StopIteration:
+            train_iter = iter(train_loader)
+            batch = next(train_iter)
+
+        batch = {k: v.to(device) if hasattr(v, "to") else v for k, v in batch.items()}
+
+        optimizer.zero_grad()
+        loss, info = policy.forward(batch)
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(policy.parameters(), 10.0)
+        optimizer.step()
+        scheduler.step()
+
+        if step % args.log_every == 0:
+            val_loss = evaluate(policy, val_loader, device, max_batches=20)
+            print(
+                f"  step {step:>6}/{args.steps} | "
+                f"train_loss: {loss.item():.4f} | "
+                f"val_loss: {val_loss:.4f} | "
+                f"lr: {scheduler.get_last_lr()[0]:.2e}"
+            )
+            policy.train()
+
+        if step % args.save_every == 0 or step == args.steps:
+            ckpt_dir = output_dir / "checkpoints" / f"{step:06d}" / "pretrained_model"
+            save_checkpoint(policy, ckpt_dir, step)
+            # Always keep a symlink/copy called "last"
+            last_dir = output_dir / "checkpoints" / "last" / "pretrained_model"
+            save_checkpoint(policy, last_dir, step)
+
+    print("Training complete.")
+
+
+def evaluate(policy, val_loader, device, max_batches: int = None) -> float:
+    """Run one pass over val_loader and return mean loss."""
+    import torch
+
+    policy.eval()
+    total_loss = 0.0
+    n_batches  = 0
+
+    with torch.no_grad():
+        for i, batch in enumerate(val_loader):
+            if max_batches is not None and i >= max_batches:
+                break
+            batch = {k: v.to(device) if hasattr(v, "to") else v for k, v in batch.items()}
+            loss, _ = policy.forward(batch)
+            total_loss += loss.item()
+            n_batches  += 1
+
+    return total_loss / max(n_batches, 1)
+
+
+def save_checkpoint(policy, ckpt_dir: Path, step: int) -> None:
+    ckpt_dir.mkdir(parents=True, exist_ok=True)
+    policy.save_pretrained(str(ckpt_dir))
+    print(f"  Checkpoint saved → {ckpt_dir}")
 
 
 # ---------------------------------------------------------------------------
@@ -403,10 +443,7 @@ def stage_train(args: argparse.Namespace) -> None:
 # ---------------------------------------------------------------------------
 
 def load_policy_from_checkpoint(ckpt_dir: Path, device):
-    """
-    Load an ACTPolicy from a pretrained_model directory saved by lerobot-train.
-    Uses LeRobot's own from_pretrained so the config is restored exactly as saved.
-    """
+    """Load an ACTPolicy from a saved pretrained_model directory."""
     try:
         from lerobot.policies.act.modeling_act import ACTPolicy
     except ImportError as exc:
@@ -419,68 +456,60 @@ def load_policy_from_checkpoint(ckpt_dir: Path, device):
     return policy
 
 
-def run_inference(policy, val_dataset, args: argparse.Namespace, device) -> None:
+def run_inference(policy, val_set, val_episode_ids: list[int],
+                  dataset, args: argparse.Namespace, device) -> None:
     """
-    Offline inference over val episodes.
+    Run inference on the first --inference-episodes validation episodes.
 
-    How ACTPolicy.select_action works
-    ----------------------------------
-    ACT generates a chunk of `chunk_size` actions in one forward pass, then
-    serves them one at a time from an internal queue on subsequent calls.
-    This means:
-      - Call policy.reset() at the start of every episode to flush the queue.
-      - Pass ONE frame at a time as an observation dict (no batch dimension on
-        the sequence axis — LeRobot adds the batch dim internally).
-      - select_action returns a single (action_dim,) tensor, i.e. (2,) here.
-        Do NOT index it as [0, 0]; it is already the scalar action for this step.
+    For each episode we iterate its frames in order, feed (image, state) to
+    the policy, and collect predicted vs ground-truth action chunks.
 
-    We compare the first action dimension (speed) and second (steer) against
-    the ground-truth first future step stored in batch["action"][:, 0, :].
+    Output: per-episode mean absolute error on speed and steer.
     """
     import torch
     import numpy as np
     from torch.utils.data import DataLoader, Subset
 
-    n_to_run = min(args.inference_episodes, val_dataset.num_episodes)
-    print(f"\nInference on {n_to_run} of {val_dataset.num_episodes} val episode(s) ...")
+    n_to_run = min(args.inference_episodes, len(val_episode_ids))
+    print(f"\nInference on {n_to_run} validation episode(s) ...")
 
-    ep_index = val_dataset.episode_data_index
+    ep_index = dataset.episode_data_index
 
-    for ep_num in range(n_to_run):
-        start = int(ep_index["from"][ep_num])
-        end   = int(ep_index["to"][ep_num])
-        ep_set = Subset(val_dataset, list(range(start, end)))
+    for ep_num, ep_id in enumerate(val_episode_ids[:n_to_run]):
+        start  = int(ep_index["from"][ep_id])
+        end    = int(ep_index["to"][ep_id])
+        ep_set = Subset(val_set.dataset, list(range(start, end)))
         loader = DataLoader(ep_set, batch_size=1, shuffle=False)
 
-        # Reset the action chunk queue at the start of each episode
-        policy.reset()
-
-        pred_speeds, gt_speeds = [], []
-        pred_steers, gt_steers = [], []
+        pred_speeds, gt_speeds   = [], []
+        pred_steers, gt_steers   = [], []
 
         with torch.no_grad():
             for batch in loader:
                 batch = {k: v.to(device) if hasattr(v, "to") else v
                          for k, v in batch.items()}
 
-                # select_action consumes one step from the internal chunk buffer,
-                # re-running the encoder only when the buffer is empty.
-                # Returns: (2,) — [speed, steer] for this timestep.
-                pred_action = policy.select_action(batch)  # (2,)
+                # policy.select_action returns the action chunk (action_horizon, 2)
+                # We take the first step of the chunk as the immediate prediction.
+                action_chunk = policy.select_action(batch)   # (1, action_horizon, 2)
+                pred_action  = action_chunk[0, 0]             # (2,) first step
 
-                # Ground truth: first future step from the action window
-                # batch["action"] shape: (1, pred_horizon, 2)
-                gt_action = batch["action"][0, 0]          # (2,)
+                gt_action = batch["action"][0, 0]             # (2,) first future step
 
                 pred_speeds.append(pred_action[0].item())
                 pred_steers.append(pred_action[1].item())
                 gt_speeds.append(gt_action[0].item())
                 gt_steers.append(gt_action[1].item())
 
-        mae_speed = float(np.mean(np.abs(np.array(pred_speeds) - np.array(gt_speeds))))
-        mae_steer = float(np.mean(np.abs(np.array(pred_steers) - np.array(gt_steers))))
+        pred_speeds = np.array(pred_speeds)
+        pred_steers = np.array(pred_steers)
+        gt_speeds   = np.array(gt_speeds)
+        gt_steers   = np.array(gt_steers)
 
-        print(f"  Val ep {ep_num:>3}  ({end - start} frames) | "
+        mae_speed = np.mean(np.abs(pred_speeds - gt_speeds))
+        mae_steer = np.mean(np.abs(pred_steers - gt_steers))
+
+        print(f"  Episode {ep_id:>3} ({end - start} frames) | "
               f"MAE speed: {mae_speed:.4f} m/s | "
               f"MAE steer: {mae_steer:.4f} deg")
 
@@ -493,9 +522,10 @@ def main() -> None:
     args = parse_args()
 
     import torch
+    torch.manual_seed(args.seed)
 
     # ------------------------------------------------------------------
-    # Stage 1: download + extract chunks 1-4
+    # Stage 1: download + extract
     # ------------------------------------------------------------------
     if not args.skip_download or not args.skip_extract:
         stage_download_extract(args)
@@ -503,7 +533,7 @@ def main() -> None:
         print("Skipping download and extraction.")
 
     # ------------------------------------------------------------------
-    # Stage 2: convert each chunk to LeRobot format
+    # Stage 2: convert to LeRobot
     # ------------------------------------------------------------------
     if not args.skip_convert:
         stage_convert(args)
@@ -511,16 +541,32 @@ def main() -> None:
         print("Skipping LeRobot conversion.")
 
     # ------------------------------------------------------------------
-    # Stage 3: train via lerobot-train (handles dataloaders, optimiser,
-    #           checkpointing — no hand-written loop needed)
+    # Stage 3: load dataset with windowing
     # ------------------------------------------------------------------
-    if not args.skip_train:
-        stage_train(args)
-    else:
-        print("Skipping training.")
+    dataset = load_lerobot_dataset(args)
 
     # ------------------------------------------------------------------
-    # Stage 4: inference on a checkpoint
+    # Stage 4: train/val split + dataloaders
+    # ------------------------------------------------------------------
+    train_set, val_set, val_episode_ids = split_dataset(
+        dataset, args.val_fraction, args.seed
+    )
+    train_loader, val_loader = make_dataloaders(train_set, val_set, args)
+
+    # ------------------------------------------------------------------
+    # Stage 5: train
+    # ------------------------------------------------------------------
+    if not args.skip_train:
+        policy, device = make_act_policy(dataset, args)
+        train(policy, train_loader, val_loader, args, device)
+    else:
+        print("Skipping training.")
+        device = torch.device(
+            args.device if (args.device != "cuda" or torch.cuda.is_available()) else "cpu"
+        )
+
+    # ------------------------------------------------------------------
+    # Stage 6: inference
     # ------------------------------------------------------------------
     ckpt_dir = args.checkpoint
     if ckpt_dir is None:
@@ -530,14 +576,8 @@ def main() -> None:
         print(f"\nNo checkpoint found at {ckpt_dir} — skipping inference.")
         return
 
-    # Load val dataset (needed for inference loop)
-    _, val_dataset = load_lerobot_dataset(args)
-
-    device = torch.device(
-        args.device if (args.device != "cuda" or torch.cuda.is_available()) else "cpu"
-    )
     infer_policy = load_policy_from_checkpoint(ckpt_dir, device)
-    run_inference(infer_policy, val_dataset, args, device)
+    run_inference(infer_policy, val_set, val_episode_ids, dataset, args, device)
 
 
 if __name__ == "__main__":
