@@ -5,6 +5,11 @@ training_sample/
 comma2k19_data/
 .vscode/
 openpilot/
+commaFSD/
+commaFSD_local/
+extracted/
+lerobot_datasets/
+outputs/
 
 
 # Video/Numpy files

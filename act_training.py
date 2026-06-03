@@ -107,6 +107,18 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--skip-extract",   action="store_true", help="Skip zip extraction")
     p.add_argument("--skip-convert",   action="store_true", help="Skip LeRobot conversion")
     p.add_argument("--skip-train",     action="store_true", help="Skip training loop")
+    p.add_argument("--skip-eval",      action="store_true", help="Skip evaluation with lerobot-eval")
+
+    p.add_argument("--eval-batch-size", type=int, default=10,
+                   help="Batch size for lerobot-eval vectorized environments")
+    p.add_argument("--eval-n-episodes", type=int, default=10,
+                   help="Number of episodes to evaluate with lerobot-eval")
+    p.add_argument("--eval-env-type", type=str, default="pusht",
+                  help="Environment type for lerobot-eval (NOTE: comma2k19 is offline data, use eval_and_plot() in notebook instead)")
+    p.add_argument("--eval-use-amp", action="store_true",
+                   help="Enable AMP during evaluation")
+    p.add_argument("--eval-output-dir", type=Path, default=None,
+                   help="Output directory for evaluation results (default: <output-dir>/eval)")
 
     return p.parse_args()
 
@@ -389,11 +401,47 @@ def stage_train(args: argparse.Namespace) -> None:
     "--log_freq", str(args.log_every),
     "--eval_freq", str(args.log_every),
     "--output_dir", str(args.output_dir),
-    "--dataset.video_backend", args.video_backend
+    # "--dataset.video_backend", args.video_backend
 
     ]
 
     print("\nLaunching LeRobot training:")
+    print("  " + " ".join(cmd))
+    subprocess.run(cmd, check=True)
+
+
+def stage_eval(args: argparse.Namespace) -> None:
+    """
+    Evaluate a trained checkpoint using LeRobot's lerobot-eval CLI.
+
+    If no checkpoint path is provided, the default is
+    <output_dir>/checkpoints/last/pretrained_model.
+    """
+    checkpoint_path = args.checkpoint
+    if checkpoint_path is None:
+        checkpoint_path = args.output_dir / "checkpoints" / "last" / "pretrained_model"
+
+    if not checkpoint_path.exists():
+        raise FileNotFoundError(
+            f"Checkpoint path does not exist: {checkpoint_path}. "
+            "Provide --checkpoint or run training first."
+        )
+
+    eval_output_dir = args.eval_output_dir or (args.output_dir / "eval")
+    eval_output_dir.mkdir(parents=True, exist_ok=True)
+
+    cmd = [
+        "lerobot-eval",
+        "--policy.pretrained_path", str(checkpoint_path),
+        "--env.type", args.eval_env_type,
+        "--eval.batch_size", str(args.eval_batch_size),
+        "--eval.n_episodes", str(args.eval_n_episodes),
+        "--policy.use_amp", "true" if args.eval_use_amp else "false",
+        "--policy.device", args.device,
+        "--output_dir", str(eval_output_dir),
+    ]
+
+    print("\nLaunching LeRobot evaluation:")
     print("  " + " ".join(cmd))
     subprocess.run(cmd, check=True)
 
@@ -492,6 +540,13 @@ def run_inference(policy, val_dataset, args: argparse.Namespace, device) -> None
 def main() -> None:
     args = parse_args()
 
+    # LeRobot's ACT policy currently only supports an observation horizon of 1
+    if args.obs_horizon != 1:
+        raise ValueError(
+            f"LeRobot's ACT policy currently only supports an observation horizon of 1. "
+            f"You provided --obs-horizon={args.obs_horizon}. Please run with --obs-horizon=1."
+        )
+
     import torch
 
     # ------------------------------------------------------------------
@@ -518,6 +573,11 @@ def main() -> None:
         stage_train(args)
     else:
         print("Skipping training.")
+
+    if not args.skip_eval:
+        stage_eval(args)
+    else:
+        print("Skipping evaluation.")
 
     # ------------------------------------------------------------------
     # Stage 4: inference on a checkpoint

@@ -52,10 +52,9 @@ def parse_args() -> argparse.Namespace:
                    help="Task string stored with every frame")
     p.add_argument("--use-videos", action=argparse.BooleanOptionalAction, default=False,
                    help="Store images as video (default: False)")
-    p.add_argument("--streaming-encoding", action="store_true",
-                   help="Use LeRobot streaming video encoding")
-    p.add_argument("--batch-encoding-size", type=int, default=1)
-    p.add_argument("--image-writer-threads",   type=int, default=4)
+    p.add_argument("--streaming-encoding",  action="store_true", default=False, help="Use LeRobot streaming video encoding")
+    p.add_argument("--batch-encoding-size", type=int, default=128)
+    p.add_argument("--image-writer-threads",   type=int, default=12)
     p.add_argument("--image-writer-processes", type=int, default=0)
     p.add_argument("--overwrite", action="store_true",
                    help="Delete existing output dataset before conversion")
